@@ -1,44 +1,44 @@
 """
-Download and prepare all GateHub training datasets.
+GateHub — dataset preparation.
 
-Steps performed:
-  1. Clone DVLPD from github.com/usama-x930/VT-LPR
-  2. Extract plate crops + reconstruct plate strings from character annotations
-     (this is the OCR training set for the CRNN)
-  3. Copy DVLPD plate-level boxes to detection/  (YOLOv8 training set)
-  4. Download Roboflow PK-plates datasets (requires ROBOFLOW_API_KEY env var)
-  5. Print a summary and next-step instructions
+Detection data  (bounding-box annotations, YOLO format):
+  Primary  : Kaggle  ubaidp1049/pakistani-vehicle-number-plate-anpr-yolo  (~900 imgs)
+  Secondary: Kaggle  zakirkhanaleemi/pakistani-car-number-plates-data
+  Extra    : Roboflow  burhan-khan/pk-number-plates  (1 678 imgs)
+             Roboflow  malik-kashif-saeed-aswwf/pakistani-number-plates  (336 imgs)
 
-IMPORTANT — DVLPD class ID mapping
-------------------------------------
-The class order in DVLPD is defined in its classes.txt file.
-Run this script once, then check data/dvlpd_raw/ for classes.txt and
-update DVLPD_CLASSES below if needed.  The defaults match the typical
-VT-LPR annotation format described in the paper.
+OCR data  (plate-crop images + text labels):
+  Synthetic plate generator (data/synth_plates.py).
+  No public Pakistani plate OCR text dataset exists — synthetic generation
+  is the standard approach for this domain.
+
+Prerequisites
+─────────────
+Kaggle (required for detection data):
+  1. Create a free account at kaggle.com
+  2. Account → Settings → Create API Token  →  downloads kaggle.json
+  3. mv ~/Downloads/kaggle.json ~/.kaggle/kaggle.json
+  4. chmod 600 ~/.kaggle/kaggle.json
+
+Roboflow (optional, adds ~2 000 more detection images):
+  export ROBOFLOW_API_KEY=<your_key>   (free account at roboflow.com)
 
 Usage:
-    python -m data.prepare
-    # or with Roboflow key:
-    ROBOFLOW_API_KEY=<key> python -m data.prepare
+  python -m data.prepare
 """
 
 import os
-import re
 import shutil
 import subprocess
-import sys
+import zipfile
 from pathlib import Path
-from typing import Optional
 
-import cv2
-import numpy as np
 from tqdm import tqdm
 
-# ── paths ────────────────────────────────────────────────────────────
-BASE         = Path('data')
-DVLPD_RAW    = BASE / 'dvlpd_raw'
-DET_ROOT     = BASE / 'detection'
-OCR_ROOT     = BASE / 'ocr'
+# ── directory layout ─────────────────────────────────────────────────
+BASE     = Path('data')
+DET_ROOT = BASE / 'detection'
+OCR_ROOT = BASE / 'ocr'
 
 for split in ('train', 'val', 'test'):
     (DET_ROOT / 'images' / split).mkdir(parents=True, exist_ok=True)
@@ -46,257 +46,261 @@ for split in ('train', 'val', 'test'):
 (OCR_ROOT / 'images').mkdir(parents=True, exist_ok=True)
 (OCR_ROOT / 'labels').mkdir(parents=True, exist_ok=True)
 
-# ── DVLPD class mapping ───────────────────────────────────────────────
-# class 0 = vehicle, 1 = plate, 2–11 = digits 0–9, 12–37 = letters A–Z
-# Verify against data/dvlpd_raw/classes.txt after cloning.
-PLATE_CLASS = 1
-DIGIT_START = 2    # class 2 → digit '0', class 3 → '1', ...
-ALPHA_START = 12   # class 12 → 'A', class 13 → 'B', ...
 
+# ── helpers ───────────────────────────────────────────────────────────
 
-def _cls_to_char(cls_id: int) -> Optional[str]:
-    if DIGIT_START <= cls_id <= DIGIT_START + 9:
-        return str(cls_id - DIGIT_START)
-    if ALPHA_START <= cls_id <= ALPHA_START + 25:
-        return chr(ord('A') + cls_id - ALPHA_START)
-    return None
-
-
-# ── step 1: clone DVLPD ──────────────────────────────────────────────
-
-def clone_dvlpd() -> Path:
-    if DVLPD_RAW.exists() and any(DVLPD_RAW.iterdir()):
-        print(f'DVLPD already present at {DVLPD_RAW}, skipping clone.')
-        return DVLPD_RAW
-    print('Cloning DVLPD (github.com/usama-x930/VT-LPR)...')
-    subprocess.run(
-        ['git', 'clone', '--depth', '1',
-         'https://github.com/usama-x930/VT-LPR.git', str(DVLPD_RAW)],
-        check=True,
-    )
-    print('Clone complete.')
-    return DVLPD_RAW
-
-
-# ── step 2: extract plate crops → OCR dataset ────────────────────────
-
-def build_ocr_dataset(dvlpd_root: Path) -> int:
-    """
-    For each DVLPD image:
-      - Find the plate bounding box (class PLATE_CLASS).
-      - Crop the plate region from the image.
-      - Collect all character annotations whose centre falls inside the plate.
-      - Sort characters left-to-right to reconstruct the plate string.
-      - Save crop as PNG + label as TXT.
-
-    Returns the number of successfully extracted plate samples.
-    """
-    # Try to locate images/ and labels/ directories in the cloned repo.
-    # The VT-LPR repo typically stores them under dataset/ or directly.
-    candidates = [
-        dvlpd_root / 'dataset',
-        dvlpd_root / 'Dataset',
-        dvlpd_root,
-    ]
-    images_dir = labels_dir = None
-    for cand in candidates:
-        if (cand / 'images').exists() and (cand / 'labels').exists():
-            images_dir = cand / 'images'
-            labels_dir = cand / 'labels'
-            break
-
-    if images_dir is None:
+def _check_kaggle() -> bool:
+    kaggle_json = Path.home() / '.kaggle' / 'kaggle.json'
+    if not kaggle_json.exists():
         print(
-            'WARNING: Could not locate images/ and labels/ inside the DVLPD repo.\n'
-            f'  Searched: {[str(c) for c in candidates]}\n'
-            '  Please check the repo structure and update build_ocr_dataset() accordingly.'
+            '\n  Kaggle credentials not found.\n'
+            '  To download Pakistani plate detection data:\n'
+            '    1. Create a free account at https://kaggle.com\n'
+            '    2. Account → Settings → Create API Token\n'
+            '    3. mv ~/Downloads/kaggle.json ~/.kaggle/kaggle.json\n'
+            '    4. chmod 600 ~/.kaggle/kaggle.json\n'
+            '    5. Re-run python -m data.prepare\n'
         )
-        return 0
+        return False
+    return True
 
-    # Print classes.txt so the user can verify the mapping
-    classes_file = next(
-        (f for f in [labels_dir.parent / 'classes.txt',
-                     dvlpd_root / 'classes.txt'] if f.exists()),
-        None,
+
+def _kaggle_download(dataset_slug: str, dest: Path) -> bool:
+    """Download and unzip a Kaggle dataset. Returns True on success."""
+    if dest.exists() and any(dest.iterdir()):
+        print(f'  {dataset_slug}: already downloaded, skipping.')
+        return True
+    dest.mkdir(parents=True, exist_ok=True)
+    print(f'  Downloading {dataset_slug} ...')
+    result = subprocess.run(
+        ['kaggle', 'datasets', 'download', dataset_slug,
+         '-p', str(dest), '--unzip'],
+        capture_output=True, text=True,
     )
-    if classes_file:
-        print(f'\nDVLPD classes ({classes_file}):')
-        for i, line in enumerate(classes_file.read_text().splitlines()):
-            print(f'  {i:2d}: {line}')
-        print()
-
-    ocr_imgs = OCR_ROOT / 'images'
-    ocr_lbls = OCR_ROOT / 'labels'
-    count = 0
-
-    img_paths = list(images_dir.glob('*.jpg')) + list(images_dir.glob('*.png'))
-    for img_path in tqdm(img_paths, desc='Building OCR dataset from DVLPD'):
-        lbl_path = labels_dir / (img_path.stem + '.txt')
-        if not lbl_path.exists():
-            continue
-
-        img = cv2.imread(str(img_path))
-        if img is None:
-            continue
-        H, W = img.shape[:2]
-
-        annotations: list[tuple[int, float, float, float, float]] = []
-        for line in lbl_path.read_text().splitlines():
-            parts = line.strip().split()
-            if len(parts) < 5:
-                continue
-            cid, cx, cy, bw, bh = int(parts[0]), *map(float, parts[1:5])
-            annotations.append((cid, cx, cy, bw, bh))
-
-        plate_anns = [a for a in annotations if a[0] == PLATE_CLASS]
-        char_anns  = [a for a in annotations if a[0] != PLATE_CLASS and a[0] >= DIGIT_START]
-
-        for p_cid, p_cx, p_cy, p_bw, p_bh in plate_anns:
-            px1 = int((p_cx - p_bw / 2) * W)
-            py1 = int((p_cy - p_bh / 2) * H)
-            px2 = int((p_cx + p_bw / 2) * W)
-            py2 = int((p_cy + p_bh / 2) * H)
-            px1, py1 = max(0, px1), max(0, py1)
-
-            crop = img[py1:py2, px1:px2]
-            if crop.size == 0:
-                continue
-
-            # Characters whose centre falls within the plate bbox
-            chars_in_plate: list[tuple[float, str]] = []
-            for c_cid, c_cx, c_cy, *_ in char_anns:
-                cx_abs = c_cx * W
-                cy_abs = c_cy * H
-                if px1 <= cx_abs <= px2 and py1 <= cy_abs <= py2:
-                    ch = _cls_to_char(c_cid)
-                    if ch:
-                        chars_in_plate.append((cx_abs, ch))
-
-            # Sort left-to-right
-            chars_in_plate.sort(key=lambda x: x[0])
-            plate_str = ''.join(c for _, c in chars_in_plate)
-
-            if len(plate_str) < 2:
-                continue
-
-            name = f'dvlpd_{count:06d}'
-            cv2.imwrite(str(ocr_imgs / f'{name}.png'), crop)
-            (ocr_lbls / f'{name}.txt').write_text(plate_str)
-            count += 1
-
-    print(f'OCR dataset: {count} plate crops saved to {OCR_ROOT}')
-    return count
+    if result.returncode != 0:
+        print(f'  ERROR: {result.stderr.strip()}')
+        return False
+    print(f'  Done → {dest}')
+    return True
 
 
-# ── step 3: copy DVLPD detection labels for YOLOv8 ──────────────────
-
-def build_detection_dataset(dvlpd_root: Path, val_frac: float = 0.15, test_frac: float = 0.05) -> None:
-    """
-    Copy DVLPD images + plate bounding-box labels to data/detection/
-    in the YOLOv8 train/val/test split expected by dataset.yaml.
-
-    We re-label everything as class 0 ('plate') to match the single-class setup.
-    """
-    candidates = [dvlpd_root / 'dataset', dvlpd_root / 'Dataset', dvlpd_root]
-    images_dir = labels_dir = None
-    for cand in candidates:
-        if (cand / 'images').exists():
-            images_dir = cand / 'images'
-            labels_dir = cand / 'labels'
-            break
-
-    if images_dir is None:
-        print('WARNING: DVLPD images not found; skipping detection dataset build.')
-        return
-
-    img_paths = sorted(list(images_dir.glob('*.jpg')) + list(images_dir.glob('*.png')))
-    n         = len(img_paths)
-    n_val     = max(1, int(n * val_frac))
-    n_test    = max(1, int(n * test_frac))
-    n_train   = n - n_val - n_test
-
-    splits = (
-        ('train', img_paths[:n_train]),
-        ('val',   img_paths[n_train:n_train + n_val]),
-        ('test',  img_paths[n_train + n_val:]),
-    )
-
-    for split_name, paths in splits:
-        for img_path in tqdm(paths, desc=f'Detection {split_name}'):
-            lbl_path = labels_dir / (img_path.stem + '.txt') if labels_dir else None
-
-            dst_img = DET_ROOT / 'images' / split_name / img_path.name
-            shutil.copy2(img_path, dst_img)
-
-            if lbl_path and lbl_path.exists():
-                dst_lbl = DET_ROOT / 'labels' / split_name / (img_path.stem + '.txt')
-                plate_lines = []
-                for line in lbl_path.read_text().splitlines():
-                    parts = line.strip().split()
-                    if len(parts) < 5:
-                        continue
-                    if int(parts[0]) == PLATE_CLASS:
-                        # Re-label as class 0 for single-class detection
-                        plate_lines.append('0 ' + ' '.join(parts[1:]))
-                if plate_lines:
-                    dst_lbl.write_text('\n'.join(plate_lines))
-
-    print(f'Detection dataset: {n_train} train / {n_val} val / {n_test} test')
-
-
-# ── step 4: download Roboflow datasets (detection only) ──────────────
-
-def download_roboflow(workspace: str, project: str, version: int, save_dir: Path) -> None:
+def _roboflow_download(workspace: str, project: str, version: int, dest: Path) -> bool:
     api_key = os.environ.get('ROBOFLOW_API_KEY')
     if not api_key:
-        print(f'  Skipping {project} — set ROBOFLOW_API_KEY to enable Roboflow downloads.')
-        return
+        print(f'  Skipping {project} (no ROBOFLOW_API_KEY set).')
+        return False
+    if dest.exists() and any(dest.iterdir()):
+        print(f'  {project}: already downloaded, skipping.')
+        return True
     try:
         from roboflow import Roboflow
         rf = Roboflow(api_key=api_key)
         rf.workspace(workspace).project(project).version(version).download(
-            'yolov8', location=str(save_dir)
+            'yolov8', location=str(dest)
         )
-        print(f'  Downloaded {project} to {save_dir}')
-    except Exception as e:
-        print(f'  Roboflow download failed for {project}: {e}')
+        print(f'  Done → {dest}')
+        return True
+    except Exception as exc:
+        print(f'  Roboflow download failed for {project}: {exc}')
+        return False
+
+
+# ── detection dataset merging ─────────────────────────────────────────
+
+def _find_yolo_root(base: Path) -> tuple[Path, Path] | tuple[None, None]:
+    """
+    Walk a downloaded dataset directory and find the first folder
+    that contains both an images/ and labels/ sub-directory.
+    Returns (images_root, labels_root) or (None, None).
+    """
+    for candidate in [base, *base.rglob('*')]:
+        if not candidate.is_dir():
+            continue
+        if (candidate / 'images').exists() and (candidate / 'labels').exists():
+            return candidate / 'images', candidate / 'labels'
+        # Some datasets use train/valid/test at the top level
+        if (candidate / 'train').exists():
+            return candidate, candidate
+    return None, None
+
+
+def _copy_split(src_imgs: Path, src_lbls: Path,
+                split: str, counter: list[int]) -> None:
+    """Copy images + labels from src dirs into data/detection/<split>/."""
+    dst_imgs = DET_ROOT / 'images' / split
+    dst_lbls = DET_ROOT / 'labels' / split
+
+    img_exts = {'.jpg', '.jpeg', '.png', '.bmp'}
+    img_paths = [p for p in src_imgs.iterdir() if p.suffix.lower() in img_exts]
+
+    for img_path in img_paths:
+        lbl_path = src_lbls / (img_path.stem + '.txt')
+        if not lbl_path.exists():
+            continue  # skip unannotated images
+
+        # Rename to avoid collisions across datasets
+        new_stem = f'ds{counter[0]:06d}'
+        shutil.copy2(img_path, dst_imgs / (new_stem + img_path.suffix))
+        shutil.copy2(lbl_path, dst_lbls / (new_stem + '.txt'))
+        counter[0] += 1
+
+
+def merge_yolo_dataset(src_root: Path, val_frac: float = 0.15,
+                       test_frac: float = 0.05) -> int:
+    """
+    Merge a downloaded YOLO dataset into data/detection/.
+    Handles both flat (images/ + labels/) and pre-split
+    (train/, valid/val/, test/) layouts.
+    Returns number of images merged.
+    """
+    counter = [_count_existing_detection_images()]
+    start   = counter[0]
+
+    # Check for pre-existing train/valid/test split
+    for split_name, dir_names in [('train', ['train']),
+                                   ('val',   ['valid', 'val']),
+                                   ('test',  ['test'])]:
+        for d in dir_names:
+            split_dir = src_root / d
+            if not split_dir.exists():
+                continue
+            imgs_dir = split_dir / 'images' if (split_dir / 'images').exists() else split_dir
+            lbls_dir = split_dir / 'labels' if (split_dir / 'labels').exists() else split_dir
+            _copy_split(imgs_dir, lbls_dir, split_name, counter)
+            break
+
+    if counter[0] > start:
+        return counter[0] - start
+
+    # Flat layout — do our own split
+    imgs_root, lbls_root = _find_yolo_root(src_root)
+    if imgs_root is None:
+        print(f'  WARNING: no YOLO structure found in {src_root}')
+        return 0
+
+    img_exts = {'.jpg', '.jpeg', '.png', '.bmp'}
+    all_imgs = sorted(
+        [p for p in imgs_root.rglob('*') if p.suffix.lower() in img_exts
+         and (lbls_root / (p.stem + '.txt')).exists()]
+    )
+    n       = len(all_imgs)
+    n_val   = max(1, int(n * val_frac))
+    n_test  = max(1, int(n * test_frac))
+    n_train = n - n_val - n_test
+
+    for img_path, split in [
+        *[(p, 'train') for p in all_imgs[:n_train]],
+        *[(p, 'val')   for p in all_imgs[n_train:n_train + n_val]],
+        *[(p, 'test')  for p in all_imgs[n_train + n_val:]],
+    ]:
+        lbl_path = lbls_root / (img_path.stem + '.txt')
+        new_stem = f'ds{counter[0]:06d}'
+        shutil.copy2(img_path, DET_ROOT / 'images' / split / (new_stem + img_path.suffix))
+        shutil.copy2(lbl_path, DET_ROOT / 'labels' / split / (new_stem + '.txt'))
+        counter[0] += 1
+
+    return counter[0] - start
+
+
+def _count_existing_detection_images() -> int:
+    return sum(
+        1 for split in ('train', 'val', 'test')
+        for _ in (DET_ROOT / 'images' / split).glob('*')
+    )
+
+
+def _clean_unannotated_detection_data() -> None:
+    """
+    Remove any images that were copied previously without a matching label file.
+    This cleans up the incorrect DVLPD copy from the first prepare run.
+    """
+    removed = 0
+    for split in ('train', 'val', 'test'):
+        imgs_dir = DET_ROOT / 'images' / split
+        lbls_dir = DET_ROOT / 'labels' / split
+        for img_path in list(imgs_dir.glob('*')):
+            lbl_path = lbls_dir / (img_path.stem + '.txt')
+            if not lbl_path.exists():
+                img_path.unlink()
+                removed += 1
+    if removed:
+        print(f'  Cleaned {removed} unannotated images from previous run.')
 
 
 # ── main ─────────────────────────────────────────────────────────────
 
 def main() -> None:
-    print('=' * 55)
+    print('=' * 58)
     print('  GateHub — dataset preparation')
-    print('=' * 55)
+    print('=' * 58)
 
-    dvlpd_root = clone_dvlpd()
-    build_detection_dataset(dvlpd_root)
-    n_ocr = build_ocr_dataset(dvlpd_root)
+    # Clean up any incorrectly copied data from a previous run
+    _clean_unannotated_detection_data()
 
-    print('\nDownloading Roboflow detection datasets...')
-    download_roboflow(
-        'burhan-khan', 'pk-number-plates', 1,
-        DET_ROOT / 'roboflow_burhan',
-    )
-    download_roboflow(
-        'malik-kashif-saeed-aswwf', 'pakistani-number-plates', 1,
-        DET_ROOT / 'roboflow_malik',
-    )
+    # ── Detection datasets ──────────────────────────────────────────
+    print('\n[1/3] Detection datasets (Kaggle)')
+    total_det = 0
 
-    print('\n' + '=' * 55)
+    if _check_kaggle():
+        raw_dir = BASE / 'raw'
+
+        # Primary: Pakistani ANPR YOLO dataset (~900 annotated images)
+        slug1 = 'ubaidp1049/pakistani-vehicle-number-plate-anpr-yolo'
+        dest1 = raw_dir / 'ubaid_anpr'
+        if _kaggle_download(slug1, dest1):
+            n = merge_yolo_dataset(dest1)
+            print(f'    ubaid_anpr  : +{n} images merged')
+            total_det += n
+
+        # Secondary: Zakir plates (images only — used for detection if annotated)
+        slug2 = 'zakirkhanaleemi/pakistani-car-number-plates-data'
+        dest2 = raw_dir / 'zakir_plates'
+        if _kaggle_download(slug2, dest2):
+            n = merge_yolo_dataset(dest2)
+            print(f'    zakir_plates: +{n} images merged')
+            total_det += n
+
+    # ── Roboflow (optional extra data) ─────────────────────────────
+    print('\n[2/3] Detection datasets (Roboflow — optional)')
+    raw_dir = BASE / 'raw'
+
+    dest_burhan = raw_dir / 'roboflow_burhan'
+    if _roboflow_download('burhan-khan', 'pk-number-plates', 1, dest_burhan):
+        n = merge_yolo_dataset(dest_burhan)
+        print(f'    roboflow_burhan: +{n} images merged')
+        total_det += n
+
+    dest_malik = raw_dir / 'roboflow_malik'
+    if _roboflow_download('malik-kashif-saeed-aswwf', 'pakistani-number-plates', 1, dest_malik):
+        n = merge_yolo_dataset(dest_malik)
+        print(f'    roboflow_malik : +{n} images merged')
+        total_det += n
+
+    # ── OCR synthetic data ─────────────────────────────────────────
+    print('\n[3/3] OCR dataset (synthetic Pakistani plates)')
+    from data.synth_plates import generate_dataset
+    n_ocr = generate_dataset(OCR_ROOT, n=6000)
+
+    # ── Summary ────────────────────────────────────────────────────
+    det_counts = {
+        split: len(list((DET_ROOT / 'images' / split).glob('*')))
+        for split in ('train', 'val', 'test')
+    }
+    print('\n' + '=' * 58)
     print('  Done.')
-    print(f'  OCR samples   : {n_ocr}  (data/ocr/)')
-    print(f'  Detection data: data/detection/')
+    print(f'\n  Detection  : {det_counts["train"]} train / '
+          f'{det_counts["val"]} val / {det_counts["test"]} test')
+    print(f'  OCR samples: {n_ocr} synthetic plate crops')
     print()
-    print('  IMPORTANT: open data/dvlpd_raw/classes.txt and verify')
-    print('  that PLATE_CLASS, DIGIT_START, ALPHA_START in this file')
-    print('  match the actual class IDs in the dataset.')
+    if total_det == 0:
+        print('  WARNING: No detection images were downloaded.')
+        print('  Set up Kaggle credentials (see instructions above)')
+        print('  and re-run python -m data.prepare.')
     print()
     print('  Next steps:')
-    print('    1.  python -m detection.train')
-    print('    2.  python -m ocr.train')
-    print('    3.  streamlit run dashboard/app.py')
-    print('=' * 55)
+    print('    python -m detection.train --ablation --epochs 30')
+    print('    python -m ocr.train --data data/ocr')
+    print('=' * 58)
 
 
 if __name__ == '__main__':

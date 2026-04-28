@@ -109,6 +109,39 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 pip install -r requirements.txt
 ```
 
+### 3. Set up Kaggle credentials (required for detection data)
+
+```bash
+# 1. Create a free account at https://kaggle.com
+# 2. Go to Account → Settings → Create API Token  (downloads kaggle.json)
+mv ~/Downloads/kaggle.json ~/.kaggle/kaggle.json
+chmod 600 ~/.kaggle/kaggle.json
+```
+
+### 4. Set up Roboflow key (optional — adds ~2 000 extra detection images)
+
+```bash
+# Create a free account at https://roboflow.com, copy your API key
+export ROBOFLOW_API_KEY=your_key_here
+```
+
+---
+
+## Data Sources
+
+### Detection data (bounding-box annotations, YOLO format)
+
+| Dataset | Images | Source |
+|---|---|---|
+| Pakistani Vehicle Number Plate ANPR | ~900 | Kaggle — `ubaidp1049/pakistani-vehicle-number-plate-anpr-yolo` |
+| Pakistani License Number Plates | variable | Kaggle — `zakirkhanaleemi/pakistani-car-number-plates-data` |
+| PK Number Plates | 1 678 | Roboflow — `burhan-khan/pk-number-plates` *(needs API key)* |
+| Pakistani Number Plates | 336 | Roboflow — `malik-kashif-saeed-aswwf/pakistani-number-plates` *(needs API key)* |
+
+### OCR data (plate text labels)
+
+No public Pakistani plate OCR dataset with text ground-truth exists (confirmed by literature). We generate synthetic training data using `data/synth_plates.py` — plates rendered with real Pakistani format strings, augmented with motion blur, noise, and perspective warp to mimic gate-camera conditions.
+
 ---
 
 ## Running the Project
@@ -119,24 +152,13 @@ Run all commands from the **project root** (`dl-project/`).
 
 ### Step 1 — Prepare datasets
 
-Downloads DVLPD from GitHub, extracts plate crops with reconstructed plate strings (OCR training set), and copies plate bounding-box annotations (detection training set). Also downloads Roboflow PK-plates datasets if `ROBOFLOW_API_KEY` is set.
+Downloads detection datasets from Kaggle and (optionally) Roboflow, then generates 6 000 synthetic plate crops for OCR training.
 
 ```bash
 python -m data.prepare
 ```
 
-**After this completes**, open `data/dvlpd_raw/classes.txt` and verify the class ID order. The defaults in `data/prepare.py` expect:
-
-```
-class 0 = vehicle
-class 1 = plate
-class 2–11 = digits 0–9
-class 12–37 = letters A–Z
-```
-
-If the order differs, update `PLATE_CLASS`, `DIGIT_START`, and `ALPHA_START` at the top of `data/prepare.py` and re-run.
-
-**Estimated time:** 20–40 min (mostly download + disk I/O)
+**Estimated time:** 10–20 min (mostly download)
 
 ---
 
