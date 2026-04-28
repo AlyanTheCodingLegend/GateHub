@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+venv/
+
+# Model weights & checkpoints (large binaries)
+checkpoints/
+runs/
+*.pt
+*.pth
+*.onnx
+
+# Datasets (large, downloaded via data/prepare.py)
+data/dvlpd_raw/
+data/detection/
+data/ocr/
+
+# Database
+gatehub.db
+
+# Results
+results/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

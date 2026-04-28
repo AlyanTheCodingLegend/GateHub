@@ -1,0 +1,11 @@
+# YOLOv8 dataset config for Pakistani license plate detection
+# Path is relative to the location of this yaml file when you run train.py
+
+path: ../data/detection   # root directory
+train: images/train
+val:   images/val
+test:  images/test
+
+nc: 1
+names:
+  - plate

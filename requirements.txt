@@ -1,0 +1,42 @@
+# ============================================================
+# GateHub — dependency list
+# RTX 5060 (Blackwell, sm_120) requires CUDA 12.8+ and
+# PyTorch 2.6+.  Install PyTorch FIRST with:
+#
+#   pip install torch torchvision torchaudio \
+#       --index-url https://download.pytorch.org/whl/cu128
+#
+# Then install the rest:
+#   pip install -r requirements.txt
+# ============================================================
+
+# --- Object detection ---
+ultralytics>=8.3.0
+
+# --- OCR ---
+easyocr>=1.7.0          # baseline comparison only
+paddlepaddle>=2.6.1     # CPU paddle is fine for CNIC (infrequent calls)
+paddleocr>=2.8.0
+
+# --- Image processing ---
+opencv-python>=4.9.0
+Pillow>=10.2.0
+albumentations>=1.4.0
+
+# --- Data & numerics ---
+numpy>=1.26.4
+pandas>=2.2.0
+tqdm>=4.66.0
+pyyaml>=6.0.1
+
+# --- Evaluation & visualisation ---
+matplotlib>=3.8.0
+seaborn>=0.13.2
+scikit-learn>=1.4.0
+
+# --- Dataset acquisition ---
+roboflow>=1.1.36
+
+# --- Dashboard & database ---
+streamlit>=1.35.0
+sqlalchemy>=2.0.30
