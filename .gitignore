@@ -15,6 +15,7 @@ runs/
 
 # Datasets (large, downloaded via data/prepare.py)
 data/dvlpd_raw/
+data/raw/
 data/detection/
 data/ocr/
 

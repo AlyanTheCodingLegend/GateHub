@@ -37,17 +37,22 @@ _AUG = dict(
 )
 
 
+_BATCH_FOR_SIZE = {'n': 8, 's': 8, 'm': 4}
+
+
 def train_single(
     size: str       = 'n',
     data_yaml: str  = 'detection/dataset.yaml',
     epochs: int     = 50,
     imgsz: int      = 640,
-    batch: int      = 16,
+    batch: int      = -1,
     device: str     = '0',
     name: str       = 'gatehub',
     project: str    = 'runs/detect',
 ) -> dict:
     """Fine-tune YOLOv8{size} and return mAP metrics."""
+    if batch < 0:
+        batch = _BATCH_FOR_SIZE.get(size, 8)
     model   = YOLO(f'yolov8{size}.pt')
     results = model.train(
         data    = data_yaml,

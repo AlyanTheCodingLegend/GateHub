@@ -16,7 +16,7 @@ Prerequisites
 ─────────────
 Kaggle (required for detection data):
   1. Create a free account at kaggle.com
-  2. Account → Settings → Create API Token  →  downloads kaggle.json
+  2. Account -> Settings -> Create API Token  ->  downloads kaggle.json
   3. mv ~/Downloads/kaggle.json ~/.kaggle/kaggle.json
   4. chmod 600 ~/.kaggle/kaggle.json
 
@@ -30,10 +30,21 @@ Usage:
 import os
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
 from tqdm import tqdm
+
+# Load .env from project root so ROBOFLOW_API_KEY is available without
+# the caller needing to export it manually.
+_env_file = Path(__file__).parent.parent / '.env'
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith('#') and '=' in _line:
+            _k, _v = _line.split('=', 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 # ── directory layout ─────────────────────────────────────────────────
 BASE     = Path('data')
@@ -62,7 +73,7 @@ def _check_kaggle() -> bool:
             '\n  Kaggle credentials not found.\n'
             '  To download Pakistani plate detection data:\n'
             '    1. Create a free account at https://kaggle.com\n'
-            '    2. Account → Settings → Create API Token\n'
+            '    2. Account -> Settings -> Create API Token\n'
             '    3. mv ~/Downloads/kaggle.json ~/.kaggle/kaggle.json\n'
             '    4. chmod 600 ~/.kaggle/kaggle.json\n'
             '    5. Re-run python -m data.prepare\n'
@@ -78,15 +89,23 @@ def _kaggle_download(dataset_slug: str, dest: Path) -> bool:
         return True
     dest.mkdir(parents=True, exist_ok=True)
     print(f'  Downloading {dataset_slug} ...')
+    import shutil as _shutil, site as _site
+    _candidates = (
+        [_shutil.which('kaggle')]
+        + [str(Path(d) / 'kaggle.exe') for d in _site.getusersitepackages().replace('site-packages','Scripts').split(os.pathsep) if d]
+        + [str(Path(sys.executable).parent / 'Scripts' / 'kaggle.exe')]
+        + [str(Path(_site.getusersitepackages()).parent.parent / 'Scripts' / 'kaggle.exe')]
+    )
+    kaggle_exe = next((c for c in _candidates if c and Path(c).exists()), 'kaggle')
     result = subprocess.run(
-        ['kaggle', 'datasets', 'download', dataset_slug,
+        [kaggle_exe, 'datasets', 'download', dataset_slug,
          '-p', str(dest), '--unzip'],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
         print(f'  ERROR: {result.stderr.strip()}')
         return False
-    print(f'  Done → {dest}')
+    print(f'  Done -> {dest}')
     return True
 
 
@@ -104,7 +123,7 @@ def _roboflow_download(workspace: str, project: str, version: int, dest: Path) -
         rf.workspace(workspace).project(project).version(version).download(
             'yolov8', location=str(dest)
         )
-        print(f'  Done → {dest}')
+        print(f'  Done -> {dest}')
         return True
     except Exception as exc:
         print(f'  Roboflow download failed for {project}: {exc}')
@@ -122,7 +141,7 @@ def _collect_pairs(root: Path) -> list[tuple[Path, Path]]:
     filenames stems.  Works for any nesting depth or directory layout
     (flat, images/images/, train/images/, etc.).
     """
-    # Build a stem → label path index from all .txt files found anywhere
+    # Build a stem -> label path index from all .txt files found anywhere
     label_index: dict[str, Path] = {}
     for lbl in root.rglob('*.txt'):
         # Skip yaml/config-like txt files that have no matching image

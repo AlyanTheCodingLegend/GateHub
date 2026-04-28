@@ -38,13 +38,15 @@ def _make_loaders(
     train_set = Subset(aug,  train_idx)
     val_set   = Subset(full, val_idx)
 
+    import platform
+    workers = 0 if platform.system() == 'Windows' else 4
     train_loader = DataLoader(
         train_set, batch_size=batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=4, pin_memory=True,
+        collate_fn=collate_fn, num_workers=workers, pin_memory=True,
     )
     val_loader = DataLoader(
         val_set, batch_size=batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=2,
+        collate_fn=collate_fn, num_workers=0,
     )
     return train_loader, val_loader
 
