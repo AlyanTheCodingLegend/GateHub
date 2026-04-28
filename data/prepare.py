@@ -113,56 +113,51 @@ def _roboflow_download(workspace: str, project: str, version: int, dest: Path) -
 
 # ── detection dataset merging ─────────────────────────────────────────
 
-def _find_yolo_root(base: Path) -> tuple[Path, Path] | tuple[None, None]:
+_IMG_EXTS = {'.jpg', '.jpeg', '.png', '.bmp'}
+
+
+def _collect_pairs(root: Path) -> list[tuple[Path, Path]]:
     """
-    Walk a downloaded dataset directory and find the first folder
-    that contains both an images/ and labels/ sub-directory.
-    Returns (images_root, labels_root) or (None, None).
+    Recursively find all (image, label) pairs under root by matching
+    filenames stems.  Works for any nesting depth or directory layout
+    (flat, images/images/, train/images/, etc.).
     """
-    for candidate in [base, *base.rglob('*')]:
-        if not candidate.is_dir():
+    # Build a stem → label path index from all .txt files found anywhere
+    label_index: dict[str, Path] = {}
+    for lbl in root.rglob('*.txt'):
+        # Skip yaml/config-like txt files that have no matching image
+        label_index[lbl.stem] = lbl
+
+    pairs: list[tuple[Path, Path]] = []
+    for img in root.rglob('*'):
+        if img.suffix.lower() not in _IMG_EXTS:
             continue
-        if (candidate / 'images').exists() and (candidate / 'labels').exists():
-            return candidate / 'images', candidate / 'labels'
-        # Some datasets use train/valid/test at the top level
-        if (candidate / 'train').exists():
-            return candidate, candidate
-    return None, None
+        if img.stem in label_index:
+            pairs.append((img, label_index[img.stem]))
 
-
-def _copy_split(src_imgs: Path, src_lbls: Path,
-                split: str, counter: list[int]) -> None:
-    """Copy images + labels from src dirs into data/detection/<split>/."""
-    dst_imgs = DET_ROOT / 'images' / split
-    dst_lbls = DET_ROOT / 'labels' / split
-
-    img_exts = {'.jpg', '.jpeg', '.png', '.bmp'}
-    img_paths = [p for p in src_imgs.iterdir() if p.suffix.lower() in img_exts]
-
-    for img_path in img_paths:
-        lbl_path = src_lbls / (img_path.stem + '.txt')
-        if not lbl_path.exists():
-            continue  # skip unannotated images
-
-        # Rename to avoid collisions across datasets
-        new_stem = f'ds{counter[0]:06d}'
-        shutil.copy2(img_path, dst_imgs / (new_stem + img_path.suffix))
-        shutil.copy2(lbl_path, dst_lbls / (new_stem + '.txt'))
-        counter[0] += 1
+    return pairs
 
 
 def merge_yolo_dataset(src_root: Path, val_frac: float = 0.15,
                        test_frac: float = 0.05) -> int:
     """
     Merge a downloaded YOLO dataset into data/detection/.
-    Handles both flat (images/ + labels/) and pre-split
-    (train/, valid/val/, test/) layouts.
+    Handles any directory layout — flat, double-nested, pre-split, etc.
     Returns number of images merged.
     """
+    import random as _random
+
     counter = [_count_existing_detection_images()]
     start   = counter[0]
 
-    # Check for pre-existing train/valid/test split
+    def _copy(img_path: Path, lbl_path: Path, split: str) -> None:
+        new_stem = f'ds{counter[0]:06d}'
+        shutil.copy2(img_path, DET_ROOT / 'images' / split / (new_stem + img_path.suffix))
+        shutil.copy2(lbl_path, DET_ROOT / 'labels' / split / (new_stem + '.txt'))
+        counter[0] += 1
+
+    # Check for pre-existing train / valid / test split directories
+    found_presplit = False
     for split_name, dir_names in [('train', ['train']),
                                    ('val',   ['valid', 'val']),
                                    ('test',  ['test'])]:
@@ -170,40 +165,33 @@ def merge_yolo_dataset(src_root: Path, val_frac: float = 0.15,
             split_dir = src_root / d
             if not split_dir.exists():
                 continue
-            imgs_dir = split_dir / 'images' if (split_dir / 'images').exists() else split_dir
-            lbls_dir = split_dir / 'labels' if (split_dir / 'labels').exists() else split_dir
-            _copy_split(imgs_dir, lbls_dir, split_name, counter)
+            for img_path, lbl_path in _collect_pairs(split_dir):
+                _copy(img_path, lbl_path, split_name)
+            found_presplit = True
             break
 
-    if counter[0] > start:
+    if found_presplit and counter[0] > start:
         return counter[0] - start
 
-    # Flat layout — do our own split
-    imgs_root, lbls_root = _find_yolo_root(src_root)
-    if imgs_root is None:
-        print(f'  WARNING: no YOLO structure found in {src_root}')
+    # No pre-split — collect everything and split ourselves
+    all_pairs = _collect_pairs(src_root)
+    if not all_pairs:
+        print(f'  WARNING: no annotated image+label pairs found in {src_root}')
         return 0
 
-    img_exts = {'.jpg', '.jpeg', '.png', '.bmp'}
-    all_imgs = sorted(
-        [p for p in imgs_root.rglob('*') if p.suffix.lower() in img_exts
-         and (lbls_root / (p.stem + '.txt')).exists()]
-    )
-    n       = len(all_imgs)
+    _random.seed(42)
+    _random.shuffle(all_pairs)
+    n       = len(all_pairs)
     n_val   = max(1, int(n * val_frac))
     n_test  = max(1, int(n * test_frac))
     n_train = n - n_val - n_test
 
-    for img_path, split in [
-        *[(p, 'train') for p in all_imgs[:n_train]],
-        *[(p, 'val')   for p in all_imgs[n_train:n_train + n_val]],
-        *[(p, 'test')  for p in all_imgs[n_train + n_val:]],
-    ]:
-        lbl_path = lbls_root / (img_path.stem + '.txt')
-        new_stem = f'ds{counter[0]:06d}'
-        shutil.copy2(img_path, DET_ROOT / 'images' / split / (new_stem + img_path.suffix))
-        shutil.copy2(lbl_path, DET_ROOT / 'labels' / split / (new_stem + '.txt'))
-        counter[0] += 1
+    for img_path, lbl_path in all_pairs[:n_train]:
+        _copy(img_path, lbl_path, 'train')
+    for img_path, lbl_path in all_pairs[n_train:n_train + n_val]:
+        _copy(img_path, lbl_path, 'val')
+    for img_path, lbl_path in all_pairs[n_train + n_val:]:
+        _copy(img_path, lbl_path, 'test')
 
     return counter[0] - start
 
