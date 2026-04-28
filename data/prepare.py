@@ -50,8 +50,14 @@ for split in ('train', 'val', 'test'):
 # ── helpers ───────────────────────────────────────────────────────────
 
 def _check_kaggle() -> bool:
-    kaggle_json = Path.home() / '.kaggle' / 'kaggle.json'
-    if not kaggle_json.exists():
+    kaggle_dir = Path.home() / '.kaggle'
+    # Accept kaggle.json (classic) or access_token (newer Kaggle auth)
+    has_creds = (
+        (kaggle_dir / 'kaggle.json').exists()
+        or (kaggle_dir / 'access_token').exists()
+        or os.environ.get('KAGGLE_USERNAME')
+    )
+    if not has_creds:
         print(
             '\n  Kaggle credentials not found.\n'
             '  To download Pakistani plate detection data:\n'
