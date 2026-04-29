@@ -116,14 +116,20 @@ def _scan_video(_pipeline, video_bytes: bytes) -> tuple:
 
 def _show_scan_result(annotated_rgb: np.ndarray, results: list[dict],
                       key_suffix: str) -> None:
-    """Show annotated image and Use-for-Entry/Exit buttons."""
+    """Show annotated image, plate crops, and Use-for-Entry/Exit buttons."""
     st.image(annotated_rgb, use_container_width=True)
     if not results:
         st.warning('No plate detected. Try a clearer image or better lighting.')
         return
     best = max(results, key=lambda r: r['det_conf'])['plate']
     for r in results:
-        st.success(f"Detected: **{r['plate']}**  (confidence {r['det_conf']:.2f})")
+        crop_rgb = r.get('crop_rgb')
+        if crop_rgb is not None:
+            col_crop, col_text = st.columns([1, 2])
+            col_crop.image(crop_rgb, caption='Plate crop sent to OCR', use_container_width=True)
+            col_text.success(f"Detected: **{r['plate']}**  (det conf {r['det_conf']:.2f})")
+        else:
+            st.success(f"Detected: **{r['plate']}**  (det conf {r['det_conf']:.2f})")
     st.divider()
     c1, c2 = st.columns(2)
     if c1.button(f'Use **{best}** for Entry',
@@ -153,7 +159,7 @@ def _scanner_widget(pipeline) -> None:
         snap = st.camera_input('Capture plate', label_visibility='collapsed')
         if snap:
             frame = _decode_upload(snap.getvalue())
-            results = pipeline.process_frame(frame)
+            results = pipeline.process_image(frame)
             _show_scan_result(_annotate(frame, results), results, 'cam')
 
     with img_tab:
@@ -161,7 +167,7 @@ def _scanner_widget(pipeline) -> None:
                                   label_visibility='collapsed')
         if upload:
             frame = _decode_upload(upload.read())
-            results = pipeline.process_frame(frame)
+            results = pipeline.process_image(frame)
             _show_scan_result(_annotate(frame, results), results, 'img')
 
     with vid_tab:
