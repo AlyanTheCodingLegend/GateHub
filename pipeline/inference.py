@@ -3,8 +3,7 @@ End-to-end GateHub inference pipeline.
 
 Stages:
   1. YOLOv8 detects plate bounding boxes in the frame.
-  2. Each detected region is perspective-corrected using contour fitting.
-  3. CRNN reads the plate string from the rectified crop.
+  2. CRNN reads the plate string from the crop.
 
 Usage:
     from pipeline.inference import GateHubPipeline
@@ -25,9 +24,6 @@ from ultralytics import YOLO
 
 from ocr.model import CRNN, IMG_H, IMG_W
 from ocr.decode import greedy_decode, beam_search_decode
-from ocr.dataset import clean_label
-
-_EASYOCR_ALLOWLIST = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-'
 
 
 _CLAHE = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(4, 4))
@@ -72,27 +68,12 @@ class GateHubPipeline:
         )
         self.crnn.eval()
 
-        # EasyOCR for still-image path — trained on real photographs, far better
-        # than the CRNN (which was trained on synthetic renders) for real plates.
-        try:
-            import easyocr
-            self._easyocr = easyocr.Reader(
-                ['en'],
-                gpu=torch.cuda.is_available(),
-                verbose=False,
-            )
-        except Exception:
-            self._easyocr = None
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def process_frame(self, frame: np.ndarray) -> list[dict]:
-        """
-        Standard pipeline for video frames (speed-optimised).
-        Uses greedy decode and default conf threshold.
-        """
+        """Standard pipeline for video frames — greedy decode, default conf."""
         detections = self._detect(frame)
         results    = []
 
@@ -111,16 +92,11 @@ class GateHubPipeline:
 
     def process_image(self, frame: np.ndarray) -> list[dict]:
         """
-        Enhanced pipeline for still images (accuracy-optimised).
-
-        Differences from process_frame:
-          - Lower conf threshold (0.25) to catch all plate candidates
-          - Larger imgsz (1280) for high-resolution photos
-          - Bbox padding to avoid clipping edge characters
-          - Multi-variant preprocessing + beam-search decode for best OCR accuracy
+        Enhanced pipeline for still images — lower conf, larger imgsz,
+        bbox padding, multi-variant preprocessing + beam-search decode.
         """
-        h, w   = frame.shape[:2]
-        imgsz  = 1280 if max(h, w) > 800 else 640
+        h, w  = frame.shape[:2]
+        imgsz = 1280 if max(h, w) > 800 else 640
         detections = self._detect(frame, conf=0.25, pad=0.05, imgsz=imgsz)
         results    = []
 
@@ -128,7 +104,7 @@ class GateHubPipeline:
             crop = frame[y1:y2, x1:x2]
             if crop.size == 0:
                 continue
-            plate = self._read_plate_easyocr(crop)
+            plate = self._read_plate_best(crop)
             results.append({
                 'plate':    plate,
                 'bbox':     [x1, y1, x2, y2],
@@ -153,8 +129,8 @@ class GateHubPipeline:
         pad:   float = 0.0,
         imgsz: int   = 640,
     ) -> list[tuple]:
-        c     = conf if conf is not None else self.conf
-        preds = self.detector.predict(frame, conf=c, verbose=False, imgsz=imgsz)
+        c      = conf if conf is not None else self.conf
+        preds  = self.detector.predict(frame, conf=c, verbose=False, imgsz=imgsz)
         fh, fw = frame.shape[:2]
         boxes  = []
         for box in preds[0].boxes:
@@ -173,47 +149,43 @@ class GateHubPipeline:
     def _to_tensor(self, gray: np.ndarray) -> torch.Tensor:
         return (
             torch.tensor(gray, dtype=torch.float32)
-            .unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            .unsqueeze(0).unsqueeze(0)
             .div(255.0)
             .to(self.device)
         )
 
     def _read_plate(self, crop: np.ndarray) -> str:
-        """Standard OCR: resize → CLAHE → greedy decode."""
+        """Resize → CLAHE → greedy decode."""
         gray = _crop_to_input(crop)
         gray = _CLAHE.apply(gray)
         with torch.no_grad():
             logits = self.crnn(self._to_tensor(gray))
         return greedy_decode(logits)[0]
 
-    def _read_plate_easyocr(self, crop: np.ndarray) -> str:
+    def _read_plate_best(self, crop: np.ndarray) -> str:
         """
-        EasyOCR-based OCR for still images.
+        Multi-variant CRNN OCR for still images.
 
-        EasyOCR is trained on real-world photographs and handles real plate
-        fonts, lighting, and textures far better than the CRNN, which was
-        trained only on synthetically rendered plates.
-
-        Falls back to CRNN if EasyOCR is unavailable or returns nothing.
+        Runs three preprocessing variants (plain, CLAHE, contrast boost)
+        in a single batched forward pass, picks the variant with the
+        highest mean per-step log-probability, then beam-search decodes it.
         """
-        if self._easyocr is not None:
-            # Upscale tiny crops so EasyOCR has enough resolution
-            h, w = crop.shape[:2]
-            if w < 160 or h < 40:
-                scale = max(160 / w, 40 / h)
-                crop = cv2.resize(
-                    crop,
-                    (int(w * scale), int(h * scale)),
-                    interpolation=cv2.INTER_CUBIC,
-                )
-            results = self._easyocr.readtext(
-                crop,
-                detail=0,
-                allowlist=_EASYOCR_ALLOWLIST,
-            )
-            text = clean_label(''.join(results))
-            if text:
-                return text
+        gray = _crop_to_input(crop)
 
-        # Fallback: CRNN with CLAHE preprocessing
-        return self._read_plate(crop)
+        v_plain = gray
+        v_clahe = _CLAHE.apply(gray)
+        v_boost = cv2.convertScaleAbs(gray, alpha=1.3, beta=10)
+
+        tensors = torch.stack([
+            torch.tensor(v, dtype=torch.float32).unsqueeze(0).div(255.0)
+            for v in (v_plain, v_clahe, v_boost)
+        ]).to(self.device)  # (3, 1, H, W)
+
+        with torch.no_grad():
+            logits = self.crnn(tensors)  # (T, 3, C)
+
+        scores   = logits.max(dim=2).values.mean(dim=0)  # (3,)
+        best_idx = int(scores.argmax().item())
+
+        best_logits = logits[:, best_idx:best_idx + 1, :]
+        return beam_search_decode(best_logits)[0]
